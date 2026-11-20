@@ -1,7 +1,7 @@
 """请求体的 Pydantic 模型与校验。"""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -49,3 +49,21 @@ class TrajectoryCreate(BaseModel):
 class MatchRequest(BaseModel):
     trajectory_id: int
     network_version: str = Field(min_length=1, description="指定匹配使用的路网版本;一次分析只使用该版本快照")
+
+
+class SurveyReplace(BaseModel):
+    """按 (路网版本, UTC 日期) 整份替换转向调查采用的分析编号清单。"""
+
+    network_version: str = Field(min_length=1, max_length=64)
+    utc_date: date = Field(description="调查日期(UTC,YYYY-MM-DD)")
+    analysis_ids: list[int] = Field(
+        default_factory=list,
+        description="本次调查采用的分析编号;同一轨迹最多一个分析;空列表表示提交零次转向的清单",
+    )
+
+    @field_validator("analysis_ids")
+    @classmethod
+    def unique_ids(cls, v: list[int]) -> list[int]:
+        if len(v) != len(set(v)):
+            raise ValueError("analysis_ids 不能重复")
+        return v

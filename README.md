@@ -39,6 +39,34 @@ python3 -m venv .venv
    - `out_of_range` — 点距所有路段超过 50 米,无候选;
    - `disconnected` — 前后点均有候选,但有向路网不连通,无法生成连续路径。
 
+## 转向抽样
+
+匹配时同时抽取**样本转向**,并作为转向证据随分析一起落库(`analysis_turns`)。只统计**同一次连续匹配**中由**相邻采样点**支撑的转向:
+
+- 两点时间间隔 `0 < Δt ≤ 30s`;
+- 两点分别匹配到**不同的有向路段** A / B;
+- 两点间的有向路径**直接跨过 A、B 的共同端点**(A 的终点即 B 的起点,中间不经过其他路段);
+- 在 A、B 两段上都行驶了**正里程**。
+
+缺口(`out_of_range` / `disconnected`)两侧的点不属于同一次连续匹配,因此跨缺口的点对不计转向。每个转向计入**后一个点**所在的 UTC 日期与小时。
+
+分析(主体 + 路径 + 缺口 + 转向证据)在**同一写事务**中写库;任一写入失败则整次分析回滚,不落库。
+
+## 转向调查清单与统计
+
+调查以 (路网版本, UTC 日期) 为单位,采用一份**分析编号清单**:
+
+- `PUT /api/turn-surveys` **整份替换**该版本该日期的清单(空数组 = 已提交但零次选择)。
+- 校验全部通过才落库,否则整份清单拒绝、旧清单与统计保持不变:
+  - 路网版本必须存在;
+  - 每个分析必须存在且属于该版本;
+  - 每个分析必须带有转向证据(升级前的旧分析可查询,但需重新匹配后才可入选);
+  - **同一轨迹最多选一份分析**。
+- `GET /api/turn-counts` 按 (进入路段, 离开路段, UTC 小时) 返回样本转向次数;`status` 区分:
+  - `no_survey` — 尚未提交清单(或清单为空);
+  - `survey` — 已提交清单,`turns` 为该清单对应的分组计数(可能为 0 条)。
+- 换清单与统计查询都**只读已落库的清单与转向证据,不重跑匹配**;查询只见当前整份清单对应的统计。
+
 ## 版本语义
 
 - 路网按版本登记,版本号全局唯一,登记后**不可变**;修订路网 = 登记新版本。
@@ -54,9 +82,11 @@ python3 -m venv .venv
 | GET | `/api/networks/{version}` | 查看某版本路网(含全部路段) |
 | POST | `/api/trajectories` | 提交轨迹(UTC 时刻 + 坐标,按时间排序存储) |
 | GET | `/api/trajectories/{id}` | 查看轨迹 |
-| POST | `/api/match` | 在指定版本上匹配,返回匹配路段、进入/离开时刻、里程、缺口 |
+| POST | `/api/match` | 在指定版本上匹配,返回匹配路段、进入/离开时刻、里程、缺口、转向证据 |
 | GET | `/api/analyses` | 查询历史分析(可按 `network_version`、`trajectory_id` 过滤) |
-| GET | `/api/analyses/{id}` | 查看分析结果 |
+| GET | `/api/analyses/{id}` | 查看分析结果(含 `turns_computed` 与 `turns` 转向证据) |
+| PUT | `/api/turn-surveys` | 按路网版本 + UTC 日期整份替换调查采用的分析编号清单 |
+| GET | `/api/turn-counts` | 按进出路段对 + UTC 小时查询样本转向次数 |
 | GET | `/health` | 健康检查 |
 
 ### 示例
@@ -86,6 +116,13 @@ curl -X POST localhost:8000/api/trajectories -H 'Content-Type: application/json'
 # 3. 匹配(轨迹 1,路网版本 v1)
 curl -X POST localhost:8000/api/match -H 'Content-Type: application/json' \
   -d '{"trajectory_id": 1, "network_version": "v1"}'
+
+# 4. 提交调查清单(2026-01-01 采用分析 1)
+curl -X PUT localhost:8000/api/turn-surveys -H 'Content-Type: application/json' \
+  -d '{"network_version": "v1", "utc_date": "2026-01-01", "analysis_ids": [1]}'
+
+# 5. 查询样本转向次数(可按 from_segment_id / to_segment_id 过滤)
+curl 'localhost:8000/api/turn-counts?network_version=v1&utc_date=2026-01-01'
 ```
 
 响应示例:
@@ -105,6 +142,12 @@ curl -X POST localhost:8000/api/match -H 'Content-Type: application/json' \
   "gaps": [
     {"seq": 0, "start_time": "2026-01-01T08:00:30.000Z",
      "end_time": "2026-01-01T08:00:50.000Z", "reason": "out_of_range"}
+  ],
+  "turns": [
+    {"from_point_index": 2, "to_point_index": 3, "from_segment_id": "S1",
+     "to_segment_id": "S2", "from_offset_m": 42.0, "to_offset_m": 0.0,
+     "from_time": "2026-01-01T08:00:20.000Z", "to_time": "2026-01-01T08:00:30.000Z",
+     "gap_seconds": 10.0, "utc_date": "2026-01-01", "utc_hour": 8}
   ]
 }
 ```
@@ -113,13 +156,14 @@ curl -X POST localhost:8000/api/match -H 'Content-Type: application/json' \
 
 ```
 app/
-  main.py      FastAPI 路由与持久化
-  matcher.py   HMM + Viterbi 匹配引擎(候选、有向图最短路、缺口检测)
+  main.py      FastAPI 路由与持久化(匹配、清单替换、统计查询)
+  matcher.py   HMM + Viterbi 匹配引擎(候选、有向图最短路、缺口、转向抽样)
   geo.py       球面距离、点到线段投影
-  db.py        SQLite 连接与建表
+  db.py        SQLite 连接与建表(分析、转向证据、调查清单)
   schemas.py   请求校验(Pydantic)
   util.py      UTC 时间处理
-tests/test_api.py  端到端测试(连续路径、两类缺口、多候选全局最优、版本隔离)
+tests/test_api.py    端到端测试(连续路径、两类缺口、多候选全局最优、版本隔离)
+tests/test_turns.py  转向抽样、清单替换与统计查询测试
 Dockerfile / docker-compose.yml
 ```
 
@@ -129,4 +173,4 @@ Dockerfile / docker-compose.yml
 | --- | --- | --- |
 | `DATABASE_PATH` | `./data/app.db`(容器内 `/data/app.db`) | SQLite 数据库文件路径 |
 
-匹配参数(`app/matcher.py` 顶部常量):吸附半径 50m、发射 σ 15m、转移衰减 β 30m、每点最大候选数 8。
+匹配参数(`app/matcher.py` 顶部常量):吸附半径 50m、发射 σ 15m、转移衰减 β 30m、每点最大候选数 8;转向抽样最大间隔 `TURN_MAX_GAP_S = 30s`。

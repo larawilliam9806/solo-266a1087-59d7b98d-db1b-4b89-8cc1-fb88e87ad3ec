@@ -27,6 +27,10 @@ TRANSITION_BETA_M = 30.0     # 转移概率指数衰减尺度
 MAX_CANDIDATES_PER_POINT = 8
 NEG_INF = float("-inf")
 
+# 转向抽样阈值:相邻采样点间隔须在 (0, 30] 秒内,且在两段上都行驶正里程
+TURN_MAX_GAP_S = 30.0
+TURN_MIN_TRAVEL_M = 1e-6
+
 GAP_OUT_OF_RANGE = "out_of_range"   # 距所有路段超过 50m,无候选
 GAP_DISCONNECTED = "disconnected"   # 有候选但路网不连通,无法生成连续路径
 
@@ -151,7 +155,9 @@ class NetworkIndex:
         middle.reverse()
         for si in middle:
             pieces.append((si, 0.0, self.segments[si].length_m))
-        pieces.append((b.seg_idx, 0.0, b.offset_m))
+        # b 的偏移为 0 时不产生在 b 上的正里程,省略该片段(避免把零长度片段当成路段访问)
+        if b.offset_m > 0.0:
+            pieces.append((b.seg_idx, 0.0, b.offset_m))
         return total, pieces
 
     # --------------------------------------------------------------- Viterbi
@@ -243,6 +249,69 @@ class NetworkIndex:
                 merged.append([si, te, tl, dd])
         return [tuple(m) for m in merged]
 
+    # --------------------------------------------------------------- 转向证据
+    @staticmethod
+    def _route_runs(parts) -> list[tuple[int, float]]:
+        """把连续路径片段合并为 [(路段下标, 该段上行驶里程), ...],丢弃零里程片段。
+
+        同一有向路段可能被拆成多段(例如在同一路段上中途掉头后再次经过),
+        按相邻同路段合并后,零里程的过渡片段不构成"在路段上行驶"。
+        """
+        runs: list[tuple[int, float]] = []
+        for si, frm, to in parts:
+            dd = to - frm
+            if dd <= TURN_MIN_TRAVEL_M:
+                continue
+            if runs and runs[-1][0] == si:
+                runs[-1] = (si, runs[-1][1] + dd)
+            else:
+                runs.append((si, dd))
+        return runs
+
+    def _turns_for_piece(self, points, idxs, path, cands) -> list[dict]:
+        """提取一段连续匹配内的样本转向证据。
+
+        仅统计同一次连续匹配中**相邻**采样点支撑的转向:
+          - 两点间隔 0 < Δt <= 30s;
+          - 两点分别匹配到不同的有向路段 A / B;
+          - 两点间的有向路径恰好是 A 剩余里程 + B 起始里程(直接跨过 A 与 B 的共同端点,
+            中间不经过其他路段);
+          - 在 A、B 两段上都行驶了正里程。
+        转向计入**后一个点**所在的 UTC 日期与小时。
+        """
+        out: list[dict] = []
+        chosen = [cands[i][p] for i, p in zip(idxs, path)]
+        for k in range(len(chosen) - 1):
+            i0, i1 = idxs[k], idxs[k + 1]
+            p0, p1 = points[i0], points[i1]
+            gap = (p1.ts - p0.ts).total_seconds()
+            if not (0.0 < gap <= TURN_MAX_GAP_S):
+                continue
+            a, b = chosen[k], chosen[k + 1]
+            if a.seg_idx == b.seg_idx:
+                continue
+            route = self.connector(a, b)
+            if route is None:
+                continue
+            runs = self._route_runs(route[1])
+            # 直接跨过共同端点:整个区间只经过 A、B 两条有向路段,且都在其上行驶正里程
+            if len(runs) != 2 or runs[0][0] != a.seg_idx or runs[1][0] != b.seg_idx:
+                continue
+            out.append({
+                "from_point_index": i0,
+                "to_point_index": i1,
+                "from_segment_id": self.segments[a.seg_idx].segment_id,
+                "to_segment_id": self.segments[b.seg_idx].segment_id,
+                "from_offset_m": round(a.offset_m, 3),
+                "to_offset_m": round(b.offset_m, 3),
+                "from_time": fmt_ts(p0.ts),
+                "to_time": fmt_ts(p1.ts),
+                "gap_seconds": round(gap, 3),
+                "utc_date": p1.ts.date().isoformat(),
+                "utc_hour": p1.ts.hour,
+            })
+        return out
+
     def match(self, points: list[TrackPoint]) -> dict:
         """对按时间升序的轨迹点列执行匹配,返回路径、缺口与统计。"""
         n = len(points)
@@ -261,14 +330,17 @@ class NetworkIndex:
             self._match_run(points, list(range(i, j + 1)), cands, pieces)
             i = j + 1
 
-        # 2) 展开为连续路径
+        # 2) 展开为连续路径,同时收集转向证据
         visits: list[tuple] = []
         ranges: list[tuple[int, int]] = []
+        turns: list[dict] = []
         for idxs, path in pieces:
             v = self._build_visits(points, idxs, path, cands)
             if v:
                 visits.extend(v)
                 ranges.append((idxs[0], idxs[-1]))
+            # 转向只在"同一次连续匹配"(即同一个 piece)内统计,不跨越缺口拼接
+            turns.extend(self._turns_for_piece(points, idxs, path, cands))
 
         # 3) 缺口
         gaps: list[dict] = []
@@ -308,4 +380,5 @@ class NetworkIndex:
             "total_distance_m": round(sum(v[3] for v in visits), 3),
             "path": path_json,
             "gaps": gaps,
+            "turns": turns,
         }
